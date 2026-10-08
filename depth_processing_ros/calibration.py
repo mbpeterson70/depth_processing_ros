@@ -22,6 +22,16 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+# GroundCalibrator.fit
+MIN_FIT_PIXELS = 100            # stop refitting below this many inlier pixels
+OUTER_ITERATIONS = 6            # fit -> re-select inliers -> refit
+IRLS_ITERATIONS = 8             # reweighting passes per fit
+MAD_TO_STD = 1.4826             # median absolute deviation -> standard deviation (Gaussian)
+HUBER_K = 1.5                   # residuals beyond HUBER_K robust sigmas are down-weighted
+EPS = 1e-9                      # avoids division by zero
+REPORT_BINS = ((1, 2), (2, 3), (3, 5), (5, 8))   # true-depth bins (m) for the before/after report
+MIN_BIN_PIXELS = 30             # a bin needs this many inliers to be reported
+
 
 @dataclass
 class CalibrationParams:
@@ -117,30 +127,29 @@ class GroundCalibrator:
         r0 = zz / zt
         keep = (r0 > p.plausible_ratio[0]) & (r0 < p.plausible_ratio[1])
         a, b = 1.0, 0.0
-        for _ in range(6):
-            if keep.sum() < 100:
+        for _ in range(OUTER_ITERATIONS):
+            if keep.sum() < MIN_FIT_PIXELS:
                 break
             X = np.column_stack([1.0 / zz[keep], np.ones(keep.sum())])
             y = 1.0 / zt[keep]
             wts = np.ones(len(y))
-            for _ in range(8):                  # IRLS, Huber-like weights on the 1/z residual
+            for _ in range(IRLS_ITERATIONS):    # IRLS, Huber-like weights on the 1/z residual
                 sw = np.sqrt(wts)
                 coef, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
                 res = np.abs(X @ coef - y)
-                s = 1.4826 * np.median(res) + 1e-9
-                wts = np.minimum(1.0, 1.5 * s / np.maximum(res, 1e-12))
+                s = MAD_TO_STD * np.median(res) + EPS
+                wts = np.minimum(1.0, HUBER_K * s / np.maximum(res, EPS))
             a, b = float(coef[0]), float(coef[1])
             corr = zz / (a + b * zz)
             keep = np.abs(corr - zt) < np.maximum(p.inlier_tol_m, p.inlier_tol_frac * zt)
         inlier_share = float(np.mean(keep)) if len(keep) else 0.0
         corr = zz / (a + b * zz)
-        bins = ((1, 2), (2, 3), (3, 5), (5, 8))
-
         def ratios(vals):
             out = []
-            for lo, hi in bins:
+            for lo, hi in REPORT_BINS:
                 k = keep & (zt >= lo) & (zt < hi)
-                out.append((lo, hi, float(np.median(vals[k] / zt[k])) if k.sum() > 30 else float("nan")))
+                out.append((lo, hi, float(np.median(vals[k] / zt[k])) if k.sum() > MIN_BIN_PIXELS
+                            else float("nan")))
             return out
 
         accepted, reason = True, "ok"
