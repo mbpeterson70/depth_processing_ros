@@ -1,0 +1,14 @@
+---
+# Corrected depth for <robot_name>'s ZED: publishes /<robot_name>/<robot_name>_zed/depth_corrected/{depth_registered,camera_info,calibration}
+launch:
+  - arg: {name: robot_name}
+  - arg: {name: camera_ns, default: $(var robot_name)_zed}
+  - arg: {name: config, default: $(find-pkg-share depth_processing_ros)/config/depth_scale_correction.yaml}
+  - node:
+      pkg: depth_processing_ros
+      exec: depth_scale_correction_node
+      name: depth_scale_correction
+      namespace: $(var robot_name)/$(var camera_ns)
+      param:
+        - {from: $(var config)}
+        - {name: ground_frame, value: $(var robot_name)/gpe}
