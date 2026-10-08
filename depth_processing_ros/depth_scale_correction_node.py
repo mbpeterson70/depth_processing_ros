@@ -12,6 +12,9 @@ its checks, the oldest half of the window is dropped and collection continues. A
 
 Publishes the corrected depth (same encoding as the input) and a copy of camera_info
 on `depth_corrected/...`, and the calibration status (latched) on `depth_corrected/calibration`.
+For ros_system_monitor it publishes a NodeInfoMsg on `~/node_status` every second: STARTUP
+while calibrating (or before any depth arrives), NOMINAL once depth is being corrected, and
+WARNING if calibration timed out and the fallback correction is in use.
 Before calibration finishes, depth is held back unless `publish_before_calibrated` is set
 (then it is passed through uncorrected). Setting `fixed_a` and `fixed_b` skips calibration.
 """
@@ -26,6 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
+from ros_system_monitor_msgs.msg import NodeInfoMsg
 from std_msgs.msg import String
 
 from depth_processing_ros.calibration import CalibrationParams, GroundCalibrator, correct_depth
@@ -89,6 +93,7 @@ class DepthScaleCorrectionNode(Node):
             ("pixel_step", 4),
             ("tf_timeout_s", 0.1),
             ("reliable_input", True),             # false: best-effort (sensor data) subscriptions
+            ("nickname", "depth_correction"),     # name for ros_system_monitor
         ])
         gp = lambda name: self.get_parameter(name).value
         self.ground_frame = gp("ground_frame")
@@ -101,7 +106,9 @@ class DepthScaleCorrectionNode(Node):
         self.fallback = (gp("fallback_a"), gp("fallback_b"))
         self.calibrator = GroundCalibrator(CalibrationParams(min_z=gp("min_z"), max_z=gp("max_z"),
                                                              pixel_step=gp("pixel_step")))
+        self.nickname = gp("nickname")
         self.ab = None
+        self.fell_back = False
         fa, fb = gp("fixed_a"), gp("fixed_b")
         if not (math.isnan(fa) or math.isnan(fb)):
             self.ab = (fa, fb)
@@ -126,6 +133,8 @@ class DepthScaleCorrectionNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.create_timer(30.0, self.log_rates)
+        self.monitor_pub = self.create_publisher(NodeInfoMsg, "~/node_status", 1)
+        self.create_timer(1.0, self.send_node_status)
 
         if self.ab is not None:
             self.publish_status(f"fixed correction a={self.ab[0]:.4f} b={self.ab[1]:+.4f}")
@@ -135,6 +144,30 @@ class DepthScaleCorrectionNode(Node):
     def publish_status(self, text):
         self.get_logger().info(text)
         self.status_pub.publish(String(data=text))
+
+    def send_node_status(self):
+        """Heartbeat + state for ros_system_monitor."""
+        msg = NodeInfoMsg()
+        msg.nickname = self.nickname
+        msg.node_name = self.get_fully_qualified_name()
+        if self.fell_back:
+            msg.status = NodeInfoMsg.WARNING
+            msg.notes = (f"no calibration accepted within {self.max_cal_time:.0f} s; "
+                         f"fallback a={self.ab[0]:.4f} b={self.ab[1]:+.4f}")
+        elif self.ab is not None:
+            msg.status = NodeInfoMsg.NOMINAL
+            msg.notes = f"correcting depth: a={self.ab[0]:.4f} b={self.ab[1]:+.4f}"
+        else:
+            msg.status = NodeInfoMsg.STARTUP
+            if self.first_stamp is None:
+                msg.notes = "waiting for depth images"
+            elif self.K is None:
+                msg.notes = "waiting for camera_info"
+            else:
+                passing = "raw depth passed through" if self.publish_before else "depth held back"
+                msg.notes = (f"calibrating: {self.calibrator.span:.0f}/{self.duration:.0f} s of usable frames "
+                             f"({passing})")
+        self.monitor_pub.publish(msg)
 
     def log_rates(self):
         state = "corrected" if self.ab is not None else (
@@ -174,6 +207,7 @@ class DepthScaleCorrectionNode(Node):
     def calibrate_step(self, msg: Image, stamp: float, depth: np.ndarray):
         if stamp - self.first_stamp > self.max_cal_time:
             self.ab = self.fallback
+            self.fell_back = True
             self.publish_status(f"no accepted calibration within {self.max_cal_time:.0f} s "
                                 f"(skips: {self.skip_reasons}); falling back to a={self.ab[0]} b={self.ab[1]}")
             return
