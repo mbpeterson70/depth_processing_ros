@@ -15,8 +15,9 @@ and then publishes corrected depth:
     /<robot>/<robot>_zed/depth_corrected/camera_info
     /<robot>/<robot>_zed/depth_corrected/calibration        (std_msgs/String, latched)
 
-Depth is held back until calibration finishes (`publish_before_calibrated: true` passes raw
-depth through instead). `fixed_a` / `fixed_b` skip calibration. If nothing is accepted within
+Until calibration finishes, raw depth is passed through uncorrected (`publish_before_calibrated:
+false` holds it back instead). If correcting an image fails for any reason, that image is passed
+through uncorrected and the node reports ERROR to ros_system_monitor. `fixed_a` / `fixed_b` skip calibration. If nothing is accepted within
 `max_calibration_time_s`, it falls back to `fallback_a` / `fallback_b` (identity by default).
 
     ros2 launch depth_processing_ros depth_scale_correction.launch.yaml robot_name:=hamilton

@@ -15,8 +15,10 @@ on `depth_corrected/...`, and the calibration status (latched) on `depth_correct
 For ros_system_monitor it publishes a NodeInfoMsg on `~/node_status` every second: STARTUP
 while calibrating (or before any depth arrives), NOMINAL once depth is being corrected, and
 WARNING if calibration timed out and the fallback correction is in use.
-Before calibration finishes, depth is held back unless `publish_before_calibrated` is set
-(then it is passed through uncorrected). Setting `fixed_a` and `fixed_b` skips calibration.
+Before calibration finishes, raw depth is passed through uncorrected (or held back if
+`publish_before_calibrated` is false). Setting `fixed_a` and `fixed_b` skips calibration.
+If processing a depth image fails for any reason, that image is passed through uncorrected
+and the node reports ERROR, so downstream depth never disappears because of this node.
 """
 
 import math
@@ -72,8 +74,8 @@ def depth_m_to_image(depth: np.ndarray, template: Image) -> Image:
 
 class DepthScaleCorrectionNode(Node):
 
-    def __init__(self):
-        super().__init__("depth_scale_correction")
+    def __init__(self, **kwargs):
+        super().__init__("depth_scale_correction", **kwargs)
         self.declare_parameters("", [
             ("depth_topic", "depth/depth_registered"),
             ("camera_info_topic", "depth/camera_info"),
@@ -83,7 +85,7 @@ class DepthScaleCorrectionNode(Node):
             ("frame_period_s", 0.5),              # one calibration frame per this many s
             ("max_calibration_time_s", 300.0),    # then fall back to fallback_a/b
             ("min_camera_height_m", 0.4),         # below this the robot is taken to be sitting
-            ("publish_before_calibrated", False),
+            ("publish_before_calibrated", True),  # false: hold depth back until calibrated
             ("fixed_a", float("nan")),            # set both to skip calibration
             ("fixed_b", float("nan")),
             ("fallback_a", 1.0),
@@ -121,6 +123,7 @@ class DepthScaleCorrectionNode(Node):
         self.last_cal_stamp = -math.inf
         self.skip_reasons = {}
         self.n_in = self.n_out = 0
+        self.last_error = None                # message of a failure since the last heartbeat
 
         prefix = gp("output_prefix")
         self.depth_pub = self.create_publisher(Image, f"{prefix}/depth_registered", 10)
@@ -150,7 +153,11 @@ class DepthScaleCorrectionNode(Node):
         msg = NodeInfoMsg()
         msg.nickname = self.nickname
         msg.node_name = self.get_fully_qualified_name()
-        if self.fell_back:
+        if self.last_error is not None:
+            msg.status = NodeInfoMsg.ERROR
+            msg.notes = f"passing raw depth through after error: {self.last_error}"
+            self.last_error = None
+        elif self.fell_back:
             msg.status = NodeInfoMsg.WARNING
             msg.notes = (f"no calibration accepted within {self.max_cal_time:.0f} s; "
                          f"fallback a={self.ab[0]:.4f} b={self.ab[1]:+.4f}")
@@ -181,21 +188,14 @@ class DepthScaleCorrectionNode(Node):
 
     def depth_cb(self, msg: Image):
         self.n_in += 1
-        stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        if self.first_stamp is None:
-            self.first_stamp = stamp
         try:
-            depth = image_to_depth_m(msg)
-        except ValueError as e:
-            self.get_logger().error(str(e), throttle_duration_sec=10.0)
-            return
-        if self.ab is None and self.K is not None:
-            self.calibrate_step(msg, stamp, depth)
-        if self.ab is not None:
-            out = depth_m_to_image(correct_depth(depth, *self.ab), msg)
-        elif self.publish_before:
+            out = self.process(msg)
+        except Exception as e:  # never drop depth because of this node: pass it through raw
+            self.last_error = f"{type(e).__name__}: {e}"
+            self.get_logger().error(f"depth correction failed, passing raw depth through: {self.last_error}",
+                                    throttle_duration_sec=10.0)
             out = msg
-        else:
+        if out is None:
             return
         self.depth_pub.publish(out)
         self.n_out += 1
@@ -203,6 +203,18 @@ class DepthScaleCorrectionNode(Node):
             info = self.info
             info.header.stamp = msg.header.stamp
             self.info_pub.publish(info)
+
+    def process(self, msg: Image):
+        """The depth image to publish (corrected, or raw while calibrating), or None to hold it back."""
+        stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        if self.first_stamp is None:
+            self.first_stamp = stamp
+        depth = image_to_depth_m(msg)
+        if self.ab is None and self.K is not None:
+            self.calibrate_step(msg, stamp, depth)
+        if self.ab is not None:
+            return depth_m_to_image(correct_depth(depth, *self.ab), msg)
+        return msg if self.publish_before else None
 
     def calibrate_step(self, msg: Image, stamp: float, depth: np.ndarray):
         if stamp - self.first_stamp > self.max_cal_time:
