@@ -21,3 +21,19 @@
     # reliable subscriptions (large images are often dropped best-effort); set false for
     # best-effort-only publishers
     reliable_input: true
+    # lidar calibration (PointCloud2); empty: ground only. While scans arrive the correction is
+    # fitted from lidar and replaces the ground one; without lidar the node falls back to the
+    # ground calibration above.
+    lidar_topic: ""
+    # fixed frame for compensating motion between scan and image (empty: no compensation)
+    lidar_odom_frame: ""
+    # rotation applied to the points in their TF frame, if the TF doesn't match the mounting
+    # (Spot hamilton: Mid-360 upside down, TF identity -> [180.0, 0.0, 0.0])
+    lidar_mount_rpy_deg: [0.0, 0.0, 0.0]
+    lidar_timeout_s: 2.0
+    lidar_calibration_duration_s: 10.0
+    # re-fit from the latest window this often while lidar keeps publishing (<= 0: fit once)
+    lidar_refit_period_s: 60.0
+    lidar_min_z: 0.5
+    # stay below the ZED max depth (depth_max, 10 m by default)
+    lidar_max_z: 9.5
