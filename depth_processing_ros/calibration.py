@@ -113,6 +113,11 @@ class GroundCalibrator:
         self.frames.append((stamp, zz, zt))
         return True, "ok"
 
+    def add_pairs(self, stamp: float, z_zed: np.ndarray, z_true: np.ndarray):
+        """Add (z_zed, z_true) pairs from another reference (e.g. stereo blocks), unchecked."""
+        self.frames.append((stamp, np.asarray(z_zed, dtype=np.float64),
+                            np.asarray(z_true, dtype=np.float64)))
+
     def drop_before(self, stamp: float):
         self.frames = [f for f in self.frames if f[0] >= stamp]
 
