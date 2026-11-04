@@ -1,0 +1,219 @@
+"""Online ZED depth-bias calibration from lidar (numpy only, no ROS dependencies).
+
+Lidar points, moved into the camera frame at the depth image's stamp, are projected into the
+depth image; each one that the camera can see and that lands on valid, non-edge depth gives a
+(z_zed, z_lidar) pair. Pairs from a window of frames are fitted with the same model as the
+ground calibration,
+
+    1 / z_true = a / z_zed + b      ->      corrected z = z_zed / (a + b * z_zed),
+
+robustly on the relative error (corrected / lidar - 1). Each range bin (coverage_bins) carries
+the same total weight, so the far range counts as much as the far more numerous near pairs.
+Unlike the ground, lidar covers the whole range the ZED reports, which is what pins down b.
+"""
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import numpy as np
+
+from depth_processing_ros.calibration import (EPS, HUBER_K, IRLS_ITERATIONS, MAD_TO_STD, MIN_BIN_PIXELS,
+                                              OUTER_ITERATIONS, REPORT_BINS, CalibrationResult)
+
+
+@dataclass
+class LidarCalibrationParams:
+    min_z: float = 0.5                 # m, lidar depth (camera frame) used for the fit
+    max_z: float = 9.5                 # m, keep below the ZED's max depth (10 m by default)
+    min_frame_pairs: int = 100         # lidar/ZED pairs a frame needs to be used
+    max_frame_pairs: int = 2000        # pairs kept per frame (random subsample)
+    visible_cell_px: int = 3           # z-buffer cell for dropping lidar points the camera can't see
+    edge_window_px: int = 5            # ZED depth near a jump of more than edge_max_ratio is not used
+    edge_max_ratio: float = 1.08
+    plausible_ratio: Tuple[float, float] = (0.5, 1.5)   # raw ZED/lidar kept for the first fit
+    a_bounds: Tuple[float, float] = (0.7, 1.2)
+    b_bounds: Tuple[float, float] = (-0.1, 0.1)
+    min_inlier_share: float = 0.5      # share of pairs consistent with the fit
+    inlier_tol_frac: float = 0.08      # |corrected / lidar - 1| below this is an inlier
+    # start-up gate: fit once the window spans min_duration_s and has min_bin_pairs lidar pairs in
+    # each coverage bin (m), so the far range is pinned down too; after max_duration_s fit anyway
+    coverage_bins: Tuple[Tuple[float, float], ...] = ((0.5, 3.0), (3.0, 5.0), (5.0, 9.5))
+    min_bin_pairs: Tuple[int, ...] = (500, 300, 300)
+    min_duration_s: float = 10.0
+    max_duration_s: float = 60.0
+
+
+# ---------------------------------------------------------------------------------- geometry
+
+def make_T(R: np.ndarray, t) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = R, t
+    return T
+
+
+def transform(T: np.ndarray, p: np.ndarray) -> np.ndarray:
+    return p @ T[:3, :3].T + T[:3, 3]
+
+
+def project(p_cam: np.ndarray, K: np.ndarray):
+    z = p_cam[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = K[0, 0] * p_cam[:, 0] / z + K[0, 2]
+        v = K[1, 1] * p_cam[:, 1] / z + K[1, 2]
+    return u, v, z
+
+
+def visible_mask(u, v, z, shape, cell: int = 3, tol: float = 0.05) -> np.ndarray:
+    """In-image points that are the nearest in their cell (within tol): the lidar sees around
+    things the camera can't, so points behind a nearer surface are dropped."""
+    h, w = shape
+    inside = (z > 0) & (u >= 0) & (u < w - 1) & (v >= 0) & (v < h - 1)
+    keep = np.zeros(len(z), bool)
+    idx = np.flatnonzero(inside)
+    if not len(idx):
+        return keep
+    cid = (v[idx] // cell).astype(np.int64) * (w // cell + 1) + (u[idx] // cell).astype(np.int64)
+    zmin = np.full(cid.max() + 1, np.inf)
+    np.minimum.at(zmin, cid, z[idx])
+    keep[idx] = z[idx] <= zmin[cid] * (1 + tol)
+    return keep
+
+
+def mask_depth_edges(depth: np.ndarray, window: int = 5, max_ratio: float = 1.08) -> np.ndarray:
+    """Copy of depth with invalid pixels and pixels near depth discontinuities set to NaN, so a
+    lidar point that lands a pixel off an edge is not compared with the wrong surface."""
+    d = depth.astype(np.float32, copy=True)
+    valid = np.isfinite(d) & (d > 0)
+    r = window // 2
+    win = lambda img, fill: np.lib.stride_tricks.sliding_window_view(
+        np.pad(img, r, constant_values=fill), (window, window))
+    hi = win(np.where(valid, d, 0.0), 0.0).max(axis=(-2, -1))
+    lo = win(np.where(valid, d, np.inf), np.inf).min(axis=(-2, -1))
+    all_valid = win(valid, False).all(axis=(-2, -1))
+    d[~(all_valid & (hi <= lo * max_ratio))] = np.nan
+    return d
+
+
+def depth_pairs(depth: np.ndarray, K: np.ndarray, p_cam: np.ndarray, p: LidarCalibrationParams,
+                rng: Optional[np.random.Generator] = None):
+    """(z_zed, z_lidar) for lidar points (camera frame) the camera sees on valid, non-edge depth."""
+    u, v, z = project(p_cam, K)
+    vis = visible_mask(u, v, z, depth.shape, p.visible_cell_px)
+    vis &= (z >= p.min_z) & (z <= p.max_z)
+    d = mask_depth_edges(depth, p.edge_window_px, p.edge_max_ratio)
+    zz = d[np.round(v[vis]).astype(int), np.round(u[vis]).astype(int)]
+    zl = z[vis]
+    ok = np.isfinite(zz) & (zz > 0)
+    zz, zl = zz[ok], zl[ok]
+    if len(zz) > p.max_frame_pairs:
+        sel = (rng or np.random.default_rng()).choice(len(zz), p.max_frame_pairs, replace=False)
+        zz, zl = zz[sel], zl[sel]
+    return zz.astype(np.float64), zl.astype(np.float64)
+
+
+# ---------------------------------------------------------------------------------- calibrator
+
+class LidarCalibrator:
+    """Accumulates (z_zed, z_lidar) pairs from frames and fits the depth correction."""
+
+    def __init__(self, params: Optional[LidarCalibrationParams] = None):
+        self.params = params or LidarCalibrationParams()
+        self.frames: List[Tuple[float, np.ndarray, np.ndarray]] = []   # (stamp, z_zed, z_lidar)
+
+    def add_pairs(self, stamp: float, z_zed: np.ndarray, z_lidar: np.ndarray) -> Tuple[bool, str]:
+        if len(z_zed) < self.params.min_frame_pairs:
+            return False, f"only {len(z_zed)} lidar/ZED pairs"
+        self.frames.append((stamp, np.asarray(z_zed, np.float64), np.asarray(z_lidar, np.float64)))
+        return True, "ok"
+
+    def drop_before(self, stamp: float):
+        self.frames = [f for f in self.frames if f[0] >= stamp]
+
+    @property
+    def span(self) -> float:
+        return self.frames[-1][0] - self.frames[0][0] if len(self.frames) > 1 else 0.0
+
+    def pairs(self) -> Tuple[np.ndarray, np.ndarray]:
+        """All (z_zed, z_lidar) pairs collected."""
+        if not self.frames:
+            return np.zeros(0), np.zeros(0)
+        return np.concatenate([f[1] for f in self.frames]), np.concatenate([f[2] for f in self.frames])
+
+    def coverage(self) -> List[int]:
+        """Lidar pairs collected in each of params.coverage_bins."""
+        zl = self.pairs()[1]
+        return [int(np.count_nonzero((zl >= lo) & (zl < hi))) for lo, hi in self.params.coverage_bins]
+
+    def coverage_text(self) -> str:
+        return ", ".join(f"{lo:g}-{hi:g} m {n}/{m}" for (lo, hi), n, m in
+                         zip(self.params.coverage_bins, self.coverage(), self.params.min_bin_pairs))
+
+    def progress(self) -> Tuple[float, Optional[Tuple[float, float]]]:
+        """(share of the gate met, 0-1; the range bin (lo, hi) still short of pairs, or None)."""
+        p = self.params
+        shares = [min(1.0, n / m) for n, m in zip(self.coverage(), p.min_bin_pairs)]
+        short = [b for b, sh in zip(p.coverage_bins, shares) if sh < 1.0]
+        return min([min(1.0, self.span / p.min_duration_s)] + shares), (short[-1] if short else None)
+
+    def ready(self) -> Tuple[bool, bool]:
+        """(fit now, ranges covered). Ready once the window is long enough and every range bin has
+        enough pairs, or, uncovered, once it reaches max_duration_s."""
+        p = self.params
+        if self.span < p.min_duration_s:
+            return False, False
+        covered = all(n >= m for n, m in zip(self.coverage(), p.min_bin_pairs))
+        return covered or self.span >= p.max_duration_s, covered
+
+    def range_weights(self, zl: np.ndarray) -> np.ndarray:
+        """Per-pair weight giving each coverage bin the same total weight; a bin with fewer than its
+        min_bin_pairs gets proportionally less, so a handful of pairs can't dominate."""
+        p = self.params
+        w = np.zeros(len(zl))
+        for (lo, hi), m in zip(p.coverage_bins, p.min_bin_pairs):
+            k = (zl >= lo) & (zl < hi)
+            w[k] = 1.0 / max(int(k.sum()), m)
+        return w / w.max() if w.any() else np.ones(len(zl))
+
+    def fit(self) -> CalibrationResult:
+        p = self.params
+        zz, zl = self.pairs()
+        r0 = zz / zl
+        keep = (r0 > p.plausible_ratio[0]) & (r0 < p.plausible_ratio[1])
+        bin_w = self.range_weights(zl)
+        a, b = 1.0, 0.0
+        for _ in range(OUTER_ITERATIONS):
+            if keep.sum() < p.min_frame_pairs:
+                break
+            # relative error of the corrected depth, linear in (a, b):
+            #   z_lidar / z_corrected - 1 = (a / z_zed + b) * z_lidar - 1
+            X = np.column_stack([zl[keep] / zz[keep], zl[keep]])
+            y = np.ones(keep.sum())
+            wts = np.ones(len(y))
+            for _ in range(IRLS_ITERATIONS):
+                sw = np.sqrt(wts * bin_w[keep])
+                coef, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+                res = np.abs(X @ coef - y)
+                s = MAD_TO_STD * np.median(res) + EPS
+                wts = np.minimum(1.0, HUBER_K * s / np.maximum(res, EPS))
+            a, b = float(coef[0]), float(coef[1])
+            keep = np.abs(zz / (a + b * zz) / zl - 1) < p.inlier_tol_frac
+        inlier_share = float(np.mean(keep)) if len(keep) else 0.0
+        corr = zz / (a + b * zz)
+
+        def ratios(vals):
+            out = []
+            for lo, hi in REPORT_BINS:
+                k = keep & (zl >= lo) & (zl < hi)
+                out.append((lo, hi, float(np.median(vals[k] / zl[k])) if k.sum() > MIN_BIN_PIXELS
+                            else float("nan")))
+            return out
+
+        accepted, reason = True, "ok"
+        if not (p.a_bounds[0] <= a <= p.a_bounds[1]):
+            accepted, reason = False, f"a = {a:.3f} outside {p.a_bounds}"
+        elif not (p.b_bounds[0] <= b <= p.b_bounds[1]):
+            accepted, reason = False, f"b = {b:+.3f} outside {p.b_bounds}"
+        elif inlier_share < p.min_inlier_share:
+            accepted, reason = False, f"only {inlier_share:.0%} of lidar pairs fit"
+        return CalibrationResult(a, b, accepted, reason, len(self.frames), int(len(zz)), inlier_share,
+                                 ratios(zz), ratios(corr))

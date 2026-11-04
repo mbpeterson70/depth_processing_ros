@@ -4,6 +4,10 @@ launch:
   - arg: {name: robot_name}
   - arg: {name: camera_ns, default: $(var robot_name)_zed}
   - arg: {name: config, default: $(find-pkg-share depth_processing_ros)/config/depth_scale_correction.yaml}
+  # e.g. /hamilton/livox/lidar; empty: ground calibration only
+  - arg: {name: lidar_topic, default: ''}
+  # ground or lidar (needs lidar_topic)
+  - arg: {name: calibration_source, default: ground}
   - node:
       pkg: depth_processing_ros
       exec: depth_scale_correction_node
@@ -12,3 +16,6 @@ launch:
       param:
         - {from: $(var config)}
         - {name: ground_frame, value: $(var robot_name)/gpe}
+        - {name: lidar_topic, value: $(var lidar_topic)}
+        - {name: calibration_source, value: $(var calibration_source)}
+        - {name: lidar_odom_frame, value: $(var robot_name)/odom}
