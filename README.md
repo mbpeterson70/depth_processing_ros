@@ -22,21 +22,35 @@ through uncorrected and the node reports ERROR to ros_system_monitor. `fixed_a` 
 
     ros2 launch depth_processing_ros depth_scale_correction.launch.yaml robot_name:=hamilton
 
-### Lidar calibration (optional)
+### Lidar calibration and depth quality
 
-With `lidar_topic` set (e.g. `/hamilton/livox/lidar`), the node also calibrates from lidar while
-scans arrive (`lidar_calibration.py`). For each frame, the scan nearest the depth image is moved
-into the camera frame through TF. `lidar_odom_frame` compensates the motion between scan and image,
-and `lidar_mount_rpy_deg` covers a lidar whose TF frame doesn't match how it is mounted (hamilton's
-Mid-360 is upside down: `[180.0, 0.0, 0.0]`). Visible points on valid, non-edge depth then give
-`(z_zed, z_lidar)` pairs. The same model is fitted after `lidar_calibration_duration_s` (10 s) and
-re-fitted from the latest window every `lidar_refit_period_s` (60 s) while the lidar keeps publishing.
-An accepted lidar fit replaces the ground or fallback correction. The ground calibration runs
-alongside it as before until there is a correction. So without lidar (not plugged in, scans
-stopped for `lidar_timeout_s`, or lidar fits rejected) the node behaves exactly as without `lidar_topic`.
+`calibration_source` picks where the one start-up calibration comes from: `ground` (above) or
+`lidar` (`lidar_calibration.py`, needs `lidar_topic`, e.g. `/hamilton/livox/lidar`). For each frame,
+the scan nearest the depth image is moved into the camera frame through TF. `lidar_odom_frame`
+compensates the motion between scan and image, and `lidar_mount_rpy_deg` covers a lidar whose TF
+frame doesn't match how it is mounted (hamilton's Mid-360 is upside down: `[180.0, 0.0, 0.0]`).
+Visible points on valid, non-edge depth then give `(z_zed, z_lidar)` pairs. Pairs accumulate from
+the start until the window spans `lidar_calibration_duration_s` (10 s) **and** each range bin
+(0.5-3, 3-5, 5-9.5 m) has `lidar_min_bin_pairs`; a short window that sees only nearby surfaces gets
+the far range wrong. After `lidar_max_calibration_duration_s` (60 s) it fits with what it has and
+reports WARNING. If no scan arrives within `lidar_wait_s`, it calibrates from the ground (WARNING).
+Either way the correction is then fixed for the session.
+
+Status rows are kept short. `depth_correction` shows the calibration progress, then the source
+and the multiplier it applies at 5 m (e.g. `lidar: x1.16 at 5 m`); it is yellow only if there
+was no lidar, the far range was never covered, or nothing was calibrated. The full fit (a, b,
+per-range ratios) is in the log and on `depth_corrected/calibration`.
+
+With `lidar_topic` set and `quality_enabled`, the node also compares the corrected depth with lidar
+every `quality_period_s` over the last 60 s (`depth_quality.py`) and publishes it on
+`~/depth_quality_status` as its own ros_system_monitor row (`zed_depth_quality`): the median
+depth error, e.g. `depth error 2.1% (vs lidar)`, plus a note if the far range (>= 4 m) is off by
+more than 12%. Green up to 8% median error, yellow up to 15%, red above (lidar calibration gives
+1-3%, the ground plane 3-9%, raw ZED 13-23% on the Spot bags). Without lidar it shows "not
+measured (no lidar)" in green. This runs whichever source calibrated.
 
     ros2 launch depth_processing_ros depth_scale_correction.launch.yaml robot_name:=hamilton \
-        lidar_topic:=/hamilton/livox/lidar
+        lidar_topic:=/hamilton/livox/lidar calibration_source:=lidar
 
 On the alpha_dcist bag, the lidar fit lowers the median depth error against lidar from 23% (raw) and
 7% (ground calibration) to about 1.5% on held-out data, and converges within about 5 s of data

@@ -7,7 +7,8 @@ ground calibration,
 
     1 / z_true = a / z_zed + b      ->      corrected z = z_zed / (a + b * z_zed),
 
-robustly on the relative error (corrected / lidar - 1), so near and far points count alike.
+robustly on the relative error (corrected / lidar - 1). Each range bin (coverage_bins) carries
+the same total weight, so the far range counts as much as the far more numerous near pairs.
 Unlike the ground, lidar covers the whole range the ZED reports, which is what pins down b.
 Offline evaluation and figures: scripts/lidar_vs_zed.py, scripts/explain_depth_calibration.py.
 """
@@ -35,6 +36,12 @@ class LidarCalibrationParams:
     b_bounds: Tuple[float, float] = (-0.1, 0.1)
     min_inlier_share: float = 0.5      # share of pairs consistent with the fit
     inlier_tol_frac: float = 0.08      # |corrected / lidar - 1| below this is an inlier
+    # start-up gate: fit once the window spans min_duration_s and has min_bin_pairs lidar pairs in
+    # each coverage bin (m), so the far range is pinned down too; after max_duration_s fit anyway
+    coverage_bins: Tuple[Tuple[float, float], ...] = ((0.5, 3.0), (3.0, 5.0), (5.0, 9.5))
+    min_bin_pairs: Tuple[int, ...] = (500, 300, 300)
+    min_duration_s: float = 10.0
+    max_duration_s: float = 60.0
 
 
 # ---------------------------------------------------------------------------------- geometry
@@ -127,12 +134,48 @@ class LidarCalibrator:
     def span(self) -> float:
         return self.frames[-1][0] - self.frames[0][0] if len(self.frames) > 1 else 0.0
 
+    def coverage(self) -> List[int]:
+        """Lidar pairs collected in each of params.coverage_bins."""
+        zl = np.concatenate([f[2] for f in self.frames]) if self.frames else np.zeros(0)
+        return [int(np.count_nonzero((zl >= lo) & (zl < hi))) for lo, hi in self.params.coverage_bins]
+
+    def coverage_text(self) -> str:
+        return ", ".join(f"{lo:g}-{hi:g} m {n}/{m}" for (lo, hi), n, m in
+                         zip(self.params.coverage_bins, self.coverage(), self.params.min_bin_pairs))
+
+    def progress(self) -> Tuple[float, Optional[Tuple[float, float]]]:
+        """(share of the gate met, 0-1; the range bin (lo, hi) still short of pairs, or None)."""
+        p = self.params
+        shares = [min(1.0, n / m) for n, m in zip(self.coverage(), p.min_bin_pairs)]
+        short = [b for b, sh in zip(p.coverage_bins, shares) if sh < 1.0]
+        return min([min(1.0, self.span / p.min_duration_s)] + shares), (short[-1] if short else None)
+
+    def ready(self) -> Tuple[bool, bool]:
+        """(fit now, ranges covered). Ready once the window is long enough and every range bin has
+        enough pairs, or, uncovered, once it reaches max_duration_s."""
+        p = self.params
+        if self.span < p.min_duration_s:
+            return False, False
+        covered = all(n >= m for n, m in zip(self.coverage(), p.min_bin_pairs))
+        return covered or self.span >= p.max_duration_s, covered
+
+    def range_weights(self, zl: np.ndarray) -> np.ndarray:
+        """Per-pair weight giving each coverage bin the same total weight; a bin with fewer than its
+        min_bin_pairs gets proportionally less, so a handful of pairs can't dominate."""
+        p = self.params
+        w = np.zeros(len(zl))
+        for (lo, hi), m in zip(p.coverage_bins, p.min_bin_pairs):
+            k = (zl >= lo) & (zl < hi)
+            w[k] = 1.0 / max(int(k.sum()), m)
+        return w / w.max() if w.any() else np.ones(len(zl))
+
     def fit(self) -> CalibrationResult:
         p = self.params
         zz = np.concatenate([f[1] for f in self.frames])
         zl = np.concatenate([f[2] for f in self.frames])
         r0 = zz / zl
         keep = (r0 > p.plausible_ratio[0]) & (r0 < p.plausible_ratio[1])
+        bin_w = self.range_weights(zl)
         a, b = 1.0, 0.0
         for _ in range(OUTER_ITERATIONS):
             if keep.sum() < p.min_frame_pairs:
@@ -143,7 +186,7 @@ class LidarCalibrator:
             y = np.ones(keep.sum())
             wts = np.ones(len(y))
             for _ in range(IRLS_ITERATIONS):
-                sw = np.sqrt(wts)
+                sw = np.sqrt(wts * bin_w[keep])
                 coef, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
                 res = np.abs(X @ coef - y)
                 s = MAD_TO_STD * np.median(res) + EPS

@@ -1,4 +1,4 @@
-"""Lidar vs ground calibration selection: lidar is used while scans arrive, the ground otherwise."""
+"""Calibration source selection: one start-up calibration from lidar or the ground."""
 
 import numpy as np
 import pytest
@@ -50,6 +50,7 @@ def node_with(**params):
     calls = []
     node.calibrate_step = lambda msg, t, d: calls.append(("ground", t))
     node.lidar_step = lambda msg, t, d: calls.append(("lidar", t))
+    node.quality_step = lambda msg, t, d: calls.append(("quality", t))
     return node, calls
 
 
@@ -67,24 +68,24 @@ def test_ground_only_without_lidar_topic():
 
 
 def test_lidar_not_plugged_in_falls_back_to_ground():
-    node, calls = node_with(lidar_topic="/lidar")
+    node, calls = node_with(lidar_topic="/lidar", calibration_source="lidar", lidar_wait_s=1.5)
     for t in (1.0, 2.0, 3.0):
-        node.depth_cb(depth_msg(t))
-    assert [c[0] for c in calls] == ["ground"] * 3
+        node.depth_cb(depth_msg(t))                # no scans: ground only after lidar_wait_s
+    assert calls == [("ground", 3.0)] and node.ground_instead
     node.destroy_node()
 
 
-def test_lidar_used_while_scans_arrive_and_ground_resumes_when_they_stop():
-    node, calls = node_with(lidar_topic="/lidar", lidar_timeout_s=2.0)
+def test_lidar_source_calibrates_from_lidar_only_then_measures_quality():
+    node, calls = node_with(lidar_topic="/lidar", calibration_source="lidar", lidar_timeout_s=2.0)
     node.lidar_cb(cloud_msg(1.0))
-    node.depth_cb(depth_msg(1.1))                  # lidar active, nothing calibrated yet: both run
-    assert [c[0] for c in calls] == ["lidar", "ground"]
+    node.depth_cb(depth_msg(1.1))                  # calibrating: lidar only
+    assert calls == [("lidar", 1.1)]
     node.ab, node.source = (0.86, -0.015), "lidar"
     calls.clear()
-    node.depth_cb(depth_msg(2.0))                  # calibrated from lidar: only lidar re-fits
-    assert [c[0] for c in calls] == ["lidar"]
+    node.depth_cb(depth_msg(2.0))                  # calibrated: no more calibration, quality only
+    assert calls == [("quality", 2.0)]
     calls.clear()
-    node.depth_cb(depth_msg(10.0))                 # scans stopped: keeps the lidar correction
+    node.depth_cb(depth_msg(10.0))                 # scans stopped: keeps the correction
     assert calls == []
     node.destroy_node()
 
@@ -92,12 +93,12 @@ def test_lidar_used_while_scans_arrive_and_ground_resumes_when_they_stop():
 def test_fixed_correction_ignores_lidar():
     node, calls = node_with(lidar_topic="/lidar", fixed_a=0.9, fixed_b=0.0)
     node.lidar_cb(cloud_msg(1.0))
-    node.depth_cb(depth_msg(1.1))
-    assert calls == [] and not node.lidar_enabled
+    node.depth_cb(depth_msg(1.1))                  # no calibration; quality is still measured
+    assert calls == [("quality", 1.1)]
     node.destroy_node()
 
 
 def test_lidar_only_config_is_allowed():
-    node, _ = node_with(lidar_topic="/lidar", ground_frame="")
+    node, _ = node_with(lidar_topic="/lidar", ground_frame="", calibration_source="lidar")
     assert node.lidar_enabled
     node.destroy_node()

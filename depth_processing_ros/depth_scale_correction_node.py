@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Correct the ZED depth scale online, calibrated from the ground (see calibration.py).
+"""Correct the ZED depth scale, calibrated once at start-up from the ground or from lidar.
 
-Subscribes to a depth image and its camera_info. While calibrating, every
+The correction 1/z = a/z_zed + b is fitted once, from the source chosen by
+`calibration_source` ("ground" or "lidar"), and then kept for the rest of the session.
+
+Ground (calibration.py): subscribes to a depth image and its camera_info. While calibrating, every
 `frame_period_s` it looks up the ground plane in the camera frame from TF (Spot's
 ground-plane estimate frame, `ground_frame`, e.g. <robot>/gpe) at the image stamp and
 adds the frame's ground pixels to the calibrator, skipping frames where the camera isn't
@@ -20,16 +23,19 @@ Before calibration finishes, raw depth is passed through uncorrected (or held ba
 If processing a depth image fails for any reason, that image is passed through uncorrected
 and the node reports ERROR, so downstream depth never disappears because of this node.
 
-Lidar (optional, `lidar_topic`): while lidar scans arrive, the correction is also calibrated
-from lidar (lidar_calibration.py): every `frame_period_s` the scan nearest the
-depth image is moved into the camera frame through TF (via `lidar_odom_frame` to compensate
-motion between scan and image, and `lidar_mount_rpy_deg` for a lidar whose TF frame doesn't
-match how it is mounted), and its visible points give (z_zed, z_lidar) pairs. After
-`lidar_calibration_duration_s` s of frames the same model is fitted; while the lidar keeps
-publishing it is re-fitted from the latest window every `lidar_refit_period_s`. A lidar fit
-replaces a ground or fallback correction. The ground calibration runs as before alongside it
-until there is a correction, so with no lidar (not plugged in, scans stopped for
-`lidar_timeout_s`, or lidar fits rejected) the node behaves exactly as without `lidar_topic`.
+Lidar (lidar_calibration.py, `calibration_source: lidar`, needs `lidar_topic`): every
+`frame_period_s` the scan nearest the depth image is moved into the camera frame through TF (via
+`lidar_odom_frame` to compensate motion between scan and image, and `lidar_mount_rpy_deg` for a
+lidar whose TF frame doesn't match how it is mounted), and its visible points give (z_zed,
+z_lidar) pairs. Pairs accumulate from the start until the window spans
+`lidar_calibration_duration_s` and every range bin (0.5-3, 3-5, 5-9.5 m) has
+`lidar_min_bin_pairs`, so the far range is pinned down too; after
+`lidar_max_calibration_duration_s` it fits with what it has and reports WARNING. If no scan
+arrives for `lidar_wait_s`, it calibrates from the ground instead (WARNING).
+
+Depth quality (`quality_enabled`, whenever lidar scans arrive): every `quality_period_s` the
+corrected depth is compared with lidar over the last 30 s (depth_quality.py), and reported on
+`~/depth_quality_status` as its own ros_system_monitor row (`quality_nickname`).
 """
 
 import math
@@ -47,6 +53,7 @@ from ros_system_monitor_msgs.msg import NodeInfoMsg
 from std_msgs.msg import String
 
 from depth_processing_ros.calibration import CalibrationParams, GroundCalibrator, correct_depth
+from depth_processing_ros.depth_quality import ERROR, NOMINAL, DepthQualityMonitor
 from depth_processing_ros.lidar_calibration import (LidarCalibrationParams, LidarCalibrator, depth_pairs,
                                                     make_T, transform)
 
@@ -135,15 +142,21 @@ class DepthScaleCorrectionNode(Node):
             ("pixel_step", 4),
             ("tf_timeout_s", 0.1),
             ("reliable_input", True),             # false: best-effort (sensor data) subscriptions
-            ("lidar_topic", ""),                  # PointCloud2; empty: ground calibration only
+            ("calibration_source", "ground"),     # "ground" or "lidar" (falls back to ground without scans)
+            ("lidar_topic", ""),                  # PointCloud2; needed for lidar calibration and quality
             ("lidar_odom_frame", ""),             # fixed frame for scan->image motion, e.g. hamilton/odom
             ("lidar_mount_rpy_deg", [0.0, 0.0, 0.0]),   # extra rotation of the points in their TF frame
             ("lidar_timeout_s", 2.0),             # no scan for this long: lidar counts as gone
-            ("lidar_calibration_duration_s", 10.0),
-            ("lidar_refit_period_s", 60.0),       # re-fit from the latest window; <= 0: fit once
+            ("lidar_wait_s", 30.0),               # no scan this long while calibrating: use the ground
+            ("lidar_calibration_duration_s", 10.0),   # minimum window
+            ("lidar_max_calibration_duration_s", 60.0),   # then fit without full range coverage
+            ("lidar_min_bin_pairs", [500, 300, 300]),     # pairs needed at 0.5-3, 3-5, 5-9.5 m
             ("lidar_min_z", 0.5),
             ("lidar_max_z", 9.5),                 # stay below the ZED max depth
             ("nickname", "depth_correction"),     # name for ros_system_monitor
+            ("quality_enabled", True),            # report corrected depth vs lidar (needs lidar_topic)
+            ("quality_period_s", 2.0),
+            ("quality_nickname", "zed_depth_quality"),
         ])
         gp = lambda name: self.get_parameter(name).value
         self.ground_frame = gp("ground_frame")
@@ -162,23 +175,36 @@ class DepthScaleCorrectionNode(Node):
         self.source = None                    # where self.ab came from: fixed, ground, lidar, fallback
         fa, fb = gp("fixed_a"), gp("fixed_b")
         lidar_topic = gp("lidar_topic")
+        self.cal_source = gp("calibration_source")       # source being calibrated from
+        self.ground_instead = None                       # why the ground is used although lidar was asked
+        self.lidar_covered = True                        # false: lidar fit without full range coverage
+        if self.cal_source not in ("ground", "lidar"):
+            raise RuntimeError(f"calibration_source must be 'ground' or 'lidar', not '{self.cal_source}'")
         if not (math.isnan(fa) or math.isnan(fb)):
             self.ab, self.source = (fa, fb), "fixed"
-        elif not self.ground_frame and not lidar_topic:
-            raise RuntimeError("set ground_frame (e.g. <robot>/gpe) and/or lidar_topic, or fixed_a and fixed_b")
+        elif self.cal_source == "lidar" and not lidar_topic:
+            raise RuntimeError("calibration_source is 'lidar': set lidar_topic")
+        elif not self.ground_frame and self.cal_source == "ground":
+            raise RuntimeError("calibration_source is 'ground': set ground_frame (e.g. <robot>/gpe)")
 
-        self.lidar_enabled = bool(lidar_topic) and self.source != "fixed"
+        self.lidar_enabled = bool(lidar_topic)
         self.lidar_odom_frame = gp("lidar_odom_frame")
         self.lidar_mount = make_T(rpy_to_matrix(*np.radians(gp("lidar_mount_rpy_deg"))), np.zeros(3))
         self.lidar_timeout = gp("lidar_timeout_s")
-        self.lidar_duration = gp("lidar_calibration_duration_s")
-        self.lidar_refit_period = gp("lidar_refit_period_s")
-        self.lidar_calibrator = LidarCalibrator(LidarCalibrationParams(min_z=gp("lidar_min_z"),
-                                                                       max_z=gp("lidar_max_z")))
+        self.lidar_wait = gp("lidar_wait_s")
+        self.lidar_calibrator = LidarCalibrator(LidarCalibrationParams(
+            min_z=gp("lidar_min_z"), max_z=gp("lidar_max_z"), min_duration_s=gp("lidar_calibration_duration_s"),
+            max_duration_s=gp("lidar_max_calibration_duration_s"),
+            min_bin_pairs=tuple(int(n) for n in gp("lidar_min_bin_pairs"))))
         self.scans = deque(maxlen=4)          # (stamp s, frame_id, points, point-time stamp s)
         self.last_lidar_frame_stamp = -math.inf
-        self.last_lidar_fit_stamp = -math.inf
         self.lidar_skip_reasons = {}
+        self.quality_enabled = gp("quality_enabled") and self.lidar_enabled
+        self.quality_period = gp("quality_period_s")
+        self.quality_nickname = gp("quality_nickname")
+        self.quality = DepthQualityMonitor()
+        self.last_quality_stamp = -math.inf
+        self.last_depth_stamp = None
 
         self.K = None
         self.info = None
@@ -202,6 +228,8 @@ class DepthScaleCorrectionNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.create_timer(30.0, self.log_rates)
         self.monitor_pub = self.create_publisher(NodeInfoMsg, "~/node_status", 1)
+        if self.quality_enabled:
+            self.quality_pub = self.create_publisher(NodeInfoMsg, "~/depth_quality_status", 1)
         self.create_timer(1.0, self.send_node_status)
 
         if self.ab is not None:
@@ -224,11 +252,13 @@ class DepthScaleCorrectionNode(Node):
             self.last_error = None
         elif self.fell_back:
             msg.status = NodeInfoMsg.WARNING
-            msg.notes = (f"no calibration accepted within {self.max_cal_time:.0f} s; "
-                         f"fallback a={self.ab[0]:.4f} b={self.ab[1]:+.4f}")
+            msg.notes = f"not calibrated within {self.max_cal_time:.0f} s: using the fallback correction"
         elif self.ab is not None:
-            msg.status = NodeInfoMsg.NOMINAL
-            msg.notes = f"correcting depth ({self.source}): a={self.ab[0]:.4f} b={self.ab[1]:+.4f}"
+            # one number: the multiplier applied at 5 m; details are in the calibration log/topic
+            caveat = self.ground_instead and "no lidar" or (not self.lidar_covered and "far range not covered")
+            msg.status = NodeInfoMsg.WARNING if caveat else NodeInfoMsg.NOMINAL
+            msg.notes = f"{self.source}: x{1.0 / (self.ab[0] + 5.0 * self.ab[1]):.2f} at 5 m" + \
+                (f" ({caveat})" if caveat else "")
         else:
             msg.status = NodeInfoMsg.STARTUP
             if self.first_stamp is None:
@@ -236,13 +266,33 @@ class DepthScaleCorrectionNode(Node):
             elif self.K is None:
                 msg.notes = "waiting for camera_info"
             else:
-                passing = "raw depth passed through" if self.publish_before else "depth held back"
-                if self.lidar_calibrator.frames:
-                    progress = f"lidar {self.lidar_calibrator.span:.0f}/{self.lidar_duration:.0f} s"
+                if self.cal_source == "lidar":
+                    done, short = self.lidar_calibrator.progress()
+                    msg.notes = f"calibrating from lidar: {done:.0%}"
+                    if short is not None and self.lidar_calibrator.span >= self.lidar_calibrator.params.min_duration_s:
+                        msg.notes += f" (needs things {short[0]:g}-{short[1]:g} m away in view)"
                 else:
-                    progress = f"ground {self.calibrator.span:.0f}/{self.duration:.0f} s"
-                msg.notes = f"calibrating: {progress} of usable frames ({passing})"
+                    msg.notes = f"calibrating from the ground: {min(1.0, self.calibrator.span / self.duration):.0%}"
         self.monitor_pub.publish(msg)
+        if self.quality_enabled:
+            self.send_quality_status()
+
+    def send_quality_status(self):
+        """ZED depth quality vs lidar, as its own ros_system_monitor row."""
+        msg = NodeInfoMsg()
+        msg.nickname = self.quality_nickname
+        msg.node_name = self.get_fully_qualified_name()
+        if self.ab is None:
+            msg.status, msg.notes = NodeInfoMsg.STARTUP, "waiting for the depth calibration"
+        elif not self.scans:
+            msg.status, msg.notes = NodeInfoMsg.NOMINAL, "not measured (no lidar)"
+        elif self.last_depth_stamp is None or not self.lidar_active(self.last_depth_stamp):
+            msg.status, msg.notes = NodeInfoMsg.WARNING, "lidar stopped: not measured"
+        else:
+            status, msg.notes = self.quality.report(*self.ab)
+            msg.status = {None: NodeInfoMsg.STARTUP, NOMINAL: NodeInfoMsg.NOMINAL,
+                          ERROR: NodeInfoMsg.ERROR}.get(status, NodeInfoMsg.WARNING)
+        self.quality_pub.publish(msg)
 
     def log_rates(self):
         state = "corrected" if self.ab is not None else (
@@ -277,23 +327,38 @@ class DepthScaleCorrectionNode(Node):
         stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
         if self.first_stamp is None:
             self.first_stamp = stamp
+        self.last_depth_stamp = stamp
         depth = image_to_depth_m(msg)
-        if self.K is not None and self.source != "fixed":
-            if self.lidar_active(stamp):
-                self.lidar_step(msg, stamp, depth)
+        if self.K is not None:
             if self.ab is None:
-                self.calibrate_step(msg, stamp, depth)
+                self.calibrate(msg, stamp, depth)
+            elif self.quality_enabled and self.lidar_active(stamp):
+                self.quality_step(msg, stamp, depth)
         if self.ab is not None:
             return depth_m_to_image(correct_depth(depth, *self.ab), msg)
         return msg if self.publish_before else None
 
-    def calibrate_step(self, msg: Image, stamp: float, depth: np.ndarray):
+    def calibrate(self, msg: Image, stamp: float, depth: np.ndarray):
+        """One start-up calibration step from the chosen source (lidar falls back to the ground)."""
         if stamp - self.first_stamp > self.max_cal_time:
             self.ab, self.source = self.fallback, "fallback"
             self.fell_back = True
+            skips = self.lidar_skip_reasons if self.cal_source == "lidar" else self.skip_reasons
             self.publish_status(f"no accepted calibration within {self.max_cal_time:.0f} s "
-                                f"(skips: {self.skip_reasons}); falling back to a={self.ab[0]} b={self.ab[1]}")
+                                f"(skips: {skips}); falling back to a={self.ab[0]} b={self.ab[1]}")
             return
+        if self.cal_source == "lidar":
+            if self.lidar_active(stamp):
+                return self.lidar_step(msg, stamp, depth)
+            last_seen = self.scans[-1][0] if self.scans else self.first_stamp
+            if stamp - last_seen < self.lidar_wait or not self.ground_frame:
+                return
+            self.cal_source = "ground"
+            self.ground_instead = f"no lidar scans for {self.lidar_wait:.0f} s: calibrating from the ground"
+            self.publish_status(self.ground_instead)
+        self.calibrate_step(msg, stamp, depth)
+
+    def calibrate_step(self, msg: Image, stamp: float, depth: np.ndarray):
         if stamp - self.last_cal_stamp < self.frame_period or not self.ground_frame:
             return
         self.last_cal_stamp = stamp
@@ -344,10 +409,9 @@ class DepthScaleCorrectionNode(Node):
     def lidar_skip(self, reason: str):
         self.lidar_skip_reasons[reason] = self.lidar_skip_reasons.get(reason, 0) + 1
 
-    def lidar_step(self, msg: Image, stamp: float, depth: np.ndarray):
-        if stamp - self.last_lidar_frame_stamp < self.frame_period:
-            return
-        self.last_lidar_frame_stamp = stamp
+    def lidar_pairs(self, msg: Image, stamp: float, depth: np.ndarray):
+        """(z_zed, z_lidar) from the scan nearest the image, moved into the camera frame; None if
+        there is no scan near the image or no TF."""
         scan_stamp, lidar_frame, xyz, t_points = min(self.scans, key=lambda s: abs(s[3] - stamp))
         if abs(t_points - stamp) > 0.2:
             return self.lidar_skip("no scan near the image")
@@ -363,30 +427,45 @@ class DepthScaleCorrectionNode(Node):
             return self.lidar_skip("no tf")
         q, t = tf.transform.rotation, tf.transform.translation
         T_cam_lidar = make_T(quat_to_matrix(q.x, q.y, q.z, q.w), [t.x, t.y, t.z]) @ self.lidar_mount
-        zz, zl = depth_pairs(depth, self.K, transform(T_cam_lidar, xyz), self.lidar_calibrator.params)
-        used, reason = self.lidar_calibrator.add_pairs(stamp, zz, zl)
+        return depth_pairs(depth, self.K, transform(T_cam_lidar, xyz), self.lidar_calibrator.params)
+
+    def lidar_step(self, msg: Image, stamp: float, depth: np.ndarray):
+        """Start-up lidar calibration: accumulate pairs until the range gate is met, then fit once."""
+        if stamp - self.last_lidar_frame_stamp < self.frame_period:
+            return
+        self.last_lidar_frame_stamp = stamp
+        pairs = self.lidar_pairs(msg, stamp, depth)
+        if pairs is None:
+            return
+        cal = self.lidar_calibrator
+        used, reason = cal.add_pairs(stamp, *pairs)
         if not used:
             return self.lidar_skip(reason.split(" ")[0] + " pairs")
-        cal = self.lidar_calibrator
-        if cal.span < self.lidar_duration:
+        fit_now, covered = cal.ready()
+        if not fit_now:
             return
-        cal.drop_before(stamp - self.lidar_duration)          # keep a sliding window
-        refit_due = self.lidar_refit_period > 0 and stamp - self.last_lidar_fit_stamp >= self.lidar_refit_period
-        if self.source == "lidar" and not refit_due:
-            return
-        self.last_lidar_fit_stamp = stamp
         res = cal.fit()
         fmt = lambda rs: ", ".join(f"{lo}-{hi} m {r:.3f}" for lo, hi, r in rs)
         if res.accepted:
-            previous = f" (was {self.source}: a={self.ab[0]:.4f} b={self.ab[1]:+.4f})" if self.ab else ""
-            self.ab, self.source, self.fell_back = (res.a, res.b), "lidar", False
+            self.ab, self.source, self.lidar_covered = (res.a, res.b), "lidar", covered
+            gate = "" if covered else f"; range coverage not met within {cal.params.max_duration_s:.0f} s"
             self.publish_status(
-                f"calibrated from lidar: a={res.a:.4f} b={res.b:+.4f}{previous} from {res.n_frames} frames, "
-                f"{res.n_pixels} pairs ({res.inlier_share:.0%} consistent); ZED/lidar before: "
-                f"{fmt(res.ratio_before)}; after: {fmt(res.ratio_after)}")
+                f"calibrated from lidar: a={res.a:.4f} b={res.b:+.4f} from {res.n_frames} frames over "
+                f"{cal.span:.0f} s, {res.n_pixels} pairs ({cal.coverage_text()}{gate}; {res.inlier_share:.0%} "
+                f"consistent); ZED/lidar before: {fmt(res.ratio_before)}; after: {fmt(res.ratio_after)}")
         else:
-            self.get_logger().warn(f"lidar calibration rejected ({res.reason}; skips: {self.lidar_skip_reasons})",
-                                   throttle_duration_sec=30.0)
+            self.get_logger().warn(f"lidar calibration rejected ({res.reason}; skips: {self.lidar_skip_reasons}); "
+                                   "dropping the older half of the window")
+            cal.drop_before(cal.frames[-1][0] - cal.span / 2)
+
+    def quality_step(self, msg: Image, stamp: float, depth: np.ndarray):
+        """Corrected-depth quality vs lidar, every quality_period_s."""
+        if stamp - self.last_quality_stamp < self.quality_period:
+            return
+        self.last_quality_stamp = stamp
+        pairs = self.lidar_pairs(msg, stamp, depth)
+        if pairs is not None:
+            self.quality.add_pairs(stamp, *pairs)
 
 
 def main():

@@ -21,9 +21,10 @@
     # reliable subscriptions (large images are often dropped best-effort); set false for
     # best-effort-only publishers
     reliable_input: true
-    # lidar calibration (PointCloud2); empty: ground only. While scans arrive the correction is
-    # fitted from lidar and replaces the ground one; without lidar the node falls back to the
-    # ground calibration above.
+    # calibrate once at start-up from "ground" (ground_frame) or "lidar" (lidar_topic; falls back to
+    # the ground if no scan arrives within lidar_wait_s)
+    calibration_source: ground
+    # lidar (PointCloud2), for lidar calibration and the depth quality report; empty: no lidar
     lidar_topic: ""
     # fixed frame for compensating motion between scan and image (empty: no compensation)
     lidar_odom_frame: ""
@@ -31,9 +32,17 @@
     # (Spot hamilton: Mid-360 upside down, TF identity -> [180.0, 0.0, 0.0])
     lidar_mount_rpy_deg: [0.0, 0.0, 0.0]
     lidar_timeout_s: 2.0
+    lidar_wait_s: 30.0
+    # lidar calibration is complete once the window spans lidar_calibration_duration_s and has
+    # lidar_min_bin_pairs pairs at 0.5-3, 3-5 and 5-9.5 m; after lidar_max_calibration_duration_s
+    # it fits with what it has and reports WARNING (far range not covered)
     lidar_calibration_duration_s: 10.0
-    # re-fit from the latest window this often while lidar keeps publishing (<= 0: fit once)
-    lidar_refit_period_s: 60.0
+    lidar_max_calibration_duration_s: 60.0
+    lidar_min_bin_pairs: [500, 300, 300]
     lidar_min_z: 0.5
     # stay below the ZED max depth (depth_max, 10 m by default)
     lidar_max_z: 9.5
+    # corrected depth vs lidar (last 30 s) as its own ros_system_monitor row, while scans arrive
+    quality_enabled: true
+    quality_period_s: 2.0
+    quality_nickname: zed_depth_quality
